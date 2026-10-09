@@ -18,6 +18,7 @@
 #include <linux/file.h>
 #include <linux/fs_context.h>
 #include <linux/fs_parser.h>
+#include <linux/sysfs.h>
 #include "overlayfs.h"
 #include "params.h"
 
@@ -1586,24 +1587,53 @@ static void ovl_inode_init_once(void *foo)
 	inode_init_once(&oi->vfs_inode);
 }
 
+static struct kobject *ovl_kobj;
+
+static ssize_t fsmount_show(struct kobject *kobj, struct kobj_attribute *attr,
+			    char *buf)
+{
+	return sysfs_emit(buf, "supported\n");
+}
+static struct kobj_attribute ovl_attr_fsmount = __ATTR_RO(fsmount);
+
+static struct attribute *ovl_feat_attrs[] = {
+	&ovl_attr_fsmount.attr,
+	NULL,
+};
+static const struct attribute_group ovl_feat_group = {
+	.name = "features",
+	.attrs = ovl_feat_attrs,
+};
+
 static int __init ovl_init(void)
 {
 	int err;
+
+	ovl_kobj = kobject_create_and_add("overlay", fs_kobj);
+	if (!ovl_kobj)
+		return -ENOMEM;
+
+	err = sysfs_create_group(ovl_kobj, &ovl_feat_group);
+	if (err)
+		goto err_kobj;
 
 	ovl_inode_cachep = kmem_cache_create("ovl_inode",
 					     sizeof(struct ovl_inode), 0,
 					     (SLAB_RECLAIM_ACCOUNT|
 					      SLAB_ACCOUNT),
 					     ovl_inode_init_once);
-	if (ovl_inode_cachep == NULL)
-		return -ENOMEM;
+	if (ovl_inode_cachep == NULL) {
+		err = -ENOMEM;
+		goto err_kobj;
+	}
 
 	err = register_filesystem(&ovl_fs_type);
 	if (!err)
 		return 0;
 
 	kmem_cache_destroy(ovl_inode_cachep);
-
+err_kobj:
+	kobject_put(ovl_kobj);
 	return err;
 }
 
@@ -1617,6 +1647,7 @@ static void __exit ovl_exit(void)
 	 */
 	rcu_barrier();
 	kmem_cache_destroy(ovl_inode_cachep);
+	kobject_put(ovl_kobj);
 }
 
 module_init(ovl_init);
