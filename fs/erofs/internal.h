@@ -174,6 +174,8 @@ struct erofs_buf {
 	u64 off;
 	struct page *page;
 	void *base;
+	unsigned int mapped_pages;
+	u8 blkszbits;
 	bool mc;
 };
 #define __EROFS_BUF_INITIALIZER	((struct erofs_buf){ .page = NULL })
@@ -394,6 +396,7 @@ extern const struct file_operations erofs_ishare_fops;
 struct erofs_iomap_iter_ctx {
 	struct page *page;
 	void *base;
+	unsigned int mapped_pages;
 	struct inode *realinode;
 };
 

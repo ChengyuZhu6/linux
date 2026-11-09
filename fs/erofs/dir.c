@@ -61,6 +61,7 @@ static int erofs_readdir(struct file *f, struct dir_context *ctx)
 	bool initial = true;
 
 	buf.mapping = dir->i_mapping;
+	buf.blkszbits = sb->s_blocksize_bits;
 	while (ctx->pos < dir->i_size) {
 		erofs_off_t dbstart = ctx->pos - ofs;
 		struct erofs_dirent *de;

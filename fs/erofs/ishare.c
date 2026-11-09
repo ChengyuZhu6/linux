@@ -64,7 +64,7 @@ bool erofs_ishare_fill_inode(struct inode *inode)
 		si->i_mode = 0444 | S_IFREG;
 		si->i_size = inode->i_size;
 		si->i_blkbits = inode->i_blkbits;
-		mapping_set_large_folios(si->i_mapping);
+		mapping_set_folio_min_order(si->i_mapping, get_order(i_blocksize(si)));
 		unlock_new_inode(si);
 	} else {
 		kfree(fp.opaque);

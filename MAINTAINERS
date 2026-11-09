@@ -9952,9 +9952,11 @@ S:	Maintained
 W:	https://erofs.docs.kernel.org
 T:	git git://git.kernel.org/pub/scm/linux/kernel/git/xiang/erofs.git dev
 F:	Documentation/ABI/testing/sysfs-fs-erofs
+F:	Documentation/filesystems/erofs-large-blocks.rst
 F:	Documentation/filesystems/erofs.rst
 F:	fs/erofs/
 F:	include/trace/events/erofs.h
+F:	tools/testing/selftests/filesystems/erofs_*
 
 ERRSEQ ERROR TRACKING INFRASTRUCTURE
 M:	Jeff Layton <jlayton@kernel.org>

@@ -13,8 +13,12 @@ void erofs_unmap_metabuf(struct erofs_buf *buf)
 {
 	if (!buf->base)
 		return;
-	kunmap_local(buf->base);
+	if (buf->mapped_pages)
+		vm_unmap_ram(buf->base, buf->mapped_pages);
+	else
+		kunmap_local(buf->base);
 	buf->base = NULL;
+	buf->mapped_pages = 0;
 }
 
 void erofs_put_metabuf(struct erofs_buf *buf)
@@ -28,7 +32,10 @@ void erofs_put_metabuf(struct erofs_buf *buf)
 
 void *erofs_bread(struct erofs_buf *buf, erofs_off_t offset, bool need_kmap)
 {
-	pgoff_t index = (buf->off + offset) >> PAGE_SHIFT;
+	unsigned int bits = max_t(unsigned int, PAGE_SHIFT,
+				  buf->blkszbits);
+	unsigned int nr = 1U << (bits - PAGE_SHIFT);
+	pgoff_t index = round_down((buf->off + offset) >> PAGE_SHIFT, nr);
 	struct folio *folio = NULL;
 
 	if (buf->page) {
@@ -47,11 +54,30 @@ void *erofs_bread(struct erofs_buf *buf, erofs_off_t offset, bool need_kmap)
 			return folio;
 	}
 	buf->page = folio_file_page(folio, index);
+	if (!folio_contains(folio, index + nr - 1)) {
+		erofs_put_metabuf(buf);
+		return ERR_PTR(-EFSCORRUPTED);
+	}
 	if (!need_kmap)
 		return NULL;
-	if (!buf->base)
-		buf->base = kmap_local_page(buf->page);
-	return buf->base + ((buf->off + offset) & ~PAGE_MASK);
+	if (!buf->base) {
+		if (nr == 1) {
+			buf->base = kmap_local_page(buf->page);
+		} else {
+			struct page *pages[DIV_ROUND_UP(BLK_MAX_BLOCK_SIZE, PAGE_SIZE)];
+			unsigned int i;
+
+			for (i = 0; i < nr; ++i)
+				pages[i] = folio_file_page(folio, index + i);
+			buf->base = erofs_vm_map_ram(pages, nr);
+			if (!buf->base) {
+				erofs_put_metabuf(buf);
+				return ERR_PTR(-ENOMEM);
+			}
+			buf->mapped_pages = nr;
+		}
+	}
+	return buf->base + ((buf->off + offset) & ((1U << bits) - 1));
 }
 
 int erofs_init_metabuf(struct erofs_buf *buf, struct super_block *sb,
@@ -60,6 +86,7 @@ int erofs_init_metabuf(struct erofs_buf *buf, struct super_block *sb,
 	struct erofs_sb_info *sbi = EROFS_SB(sb);
 
 	buf->mc = false;
+	buf->blkszbits = sb->s_blocksize_bits;
 	if (in_metabox) {
 		if (unlikely(!sbi->metabox_inode))
 			return -EFSCORRUPTED;
@@ -345,6 +372,7 @@ static int erofs_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
 			iomap->inline_data = ptr;
 			ctx->page = buf.page;
 			ctx->base = buf.base;
+			ctx->mapped_pages = buf.mapped_pages;
 		}
 	} else {
 		iomap->type = IOMAP_MAPPED;
@@ -362,6 +390,7 @@ static int erofs_iomap_end(struct inode *inode, loff_t pos, loff_t length,
 		struct erofs_buf buf = {
 			.page = ctx->page,
 			.base = ctx->base,
+			.mapped_pages = ctx->mapped_pages,
 		};
 
 		DBG_BUGON(iomap->type != IOMAP_INLINE);

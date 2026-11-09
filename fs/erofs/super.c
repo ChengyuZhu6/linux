@@ -269,9 +269,33 @@ static int erofs_read_superblock(struct super_block *sb)
 	}
 
 	sbi->blkszbits = dsb->blkszbits;
-	if (sbi->blkszbits < 9 || sbi->blkszbits > PAGE_SHIFT) {
+	if (sbi->blkszbits < 9 || sbi->blkszbits > ilog2(BLK_MAX_BLOCK_SIZE)) {
 		erofs_err(sb, "blkszbits %u isn't supported", sbi->blkszbits);
 		goto out;
+	}
+	if (sb->s_blocksize_bits != sbi->blkszbits) {
+		erofs_put_metabuf(&buf);
+		if (erofs_is_fileio_mode(sbi)) {
+			struct inode *cache = sbi->managed_cache;
+
+			truncate_inode_pages(cache->i_mapping, 0);
+			sb->s_blocksize = 1U << sbi->blkszbits;
+			sb->s_blocksize_bits = sbi->blkszbits;
+			cache->i_blkbits = sbi->blkszbits;
+			mapping_set_folio_min_order(cache->i_mapping,
+						   get_order(sb->s_blocksize));
+		} else if (!sb_set_blocksize(sb, 1U << sbi->blkszbits)) {
+			return -EINVAL;
+		}
+		data = erofs_read_metabuf(&buf, sb, 0, false);
+		if (IS_ERR(data))
+			return PTR_ERR(data);
+		dsb = data + EROFS_SUPER_OFFSET;
+		if (le32_to_cpu(dsb->magic) != EROFS_SUPER_MAGIC_V1 ||
+		    dsb->blkszbits != sbi->blkszbits) {
+			ret = -EFSCORRUPTED;
+			goto out;
+		}
 	}
 	if (dsb->dirblkbits) {
 		erofs_err(sb, "dirblkbits %u isn't supported", dsb->dirblkbits);
@@ -294,7 +318,8 @@ static int erofs_read_superblock(struct super_block *sb)
 	}
 
 	sbi->sb_size = 128 + dsb->sb_extslots * EROFS_SB_EXTSLOT_SIZE;
-	if (sbi->sb_size > PAGE_SIZE - EROFS_SUPER_OFFSET) {
+	if (sbi->sb_size > max_t(unsigned long, PAGE_SIZE, sb->s_blocksize) -
+			   EROFS_SUPER_OFFSET) {
 		erofs_err(sb, "invalid sb_extslots %u (more than a fs block)",
 			  sbi->sb_size);
 		goto out;
@@ -349,6 +374,13 @@ static int erofs_read_superblock(struct super_block *sb)
 		}
 	}
 
+	if (sbi->blkszbits > PAGE_SHIFT &&
+	    (dsb->u1.available_compr_algs || erofs_sb_has_lz4_0padding(sbi) ||
+	     erofs_sb_has_metabox(sbi))) {
+		erofs_err(sb, "compression with block size larger than PAGE_SIZE is unsupported");
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
 	if (IS_ENABLED(CONFIG_EROFS_FS_ZIP)) {
 		ret = z_erofs_parse_cfgs(sb, dsb);
 		if (ret < 0)
@@ -361,6 +393,10 @@ static int erofs_read_superblock(struct super_block *sb)
 	}
 
 	ret = erofs_scan_devices(sb, dsb);
+	if (!ret && sbi->blkszbits > PAGE_SHIFT && sbi->device_id_mask) {
+		erofs_err(sb, "large blocks with external devices are unsupported");
+		ret = -EOPNOTSUPP;
+	}
 
 	if (erofs_sb_has_48bit(sbi))
 		erofs_info(sb, "EXPERIMENTAL 48-bit layout support in use. Use at your own risk!");
@@ -650,6 +686,7 @@ int erofs_setup_managed_cache(struct super_block *sb)
 		set_nlink(inode, 1);
 		inode->i_size = OFFSET_MAX;
 		mapping_set_gfp_mask(inode->i_mapping, GFP_KERNEL);
+		mapping_set_folio_min_order(inode->i_mapping, get_order(sb->s_blocksize));
 		EROFS_SB(sb)->managed_cache = inode;
 	}
 	return 0;
@@ -732,20 +769,11 @@ static int erofs_fc_fill_super(struct super_block *sb, struct fs_context *fc)
 	if (err)
 		return err;
 
-	if (sb->s_blocksize_bits != sbi->blkszbits) {
-		if (erofs_is_fileio_mode(sbi)) {
-			sb->s_blocksize = 1 << sbi->blkszbits;
-			sb->s_blocksize_bits = sbi->blkszbits;
-		} else if (!sb_set_blocksize(sb, 1 << sbi->blkszbits)) {
-			errorfc(fc, "failed to set erofs blksize");
-			return -EINVAL;
-		}
-	}
 	if (sbi->dif0.fsoff & (sb->s_blocksize - 1))
 		return invalfc(fc, "fsoffset %llu is not aligned to block size %lu",
 			       sbi->dif0.fsoff, sb->s_blocksize);
 
-	if (test_opt(&sbi->opt, DAX_ALWAYS) && sbi->blkszbits != PAGE_SHIFT) {
+	if (test_opt(&sbi->opt, DAX_ALWAYS) && sbi->blkszbits < PAGE_SHIFT) {
 		erofs_info(sb, "unsupported blocksize for DAX");
 		clear_opt(&sbi->opt, DAX_ALWAYS);
 	}
@@ -1023,7 +1051,7 @@ static struct file_system_type erofs_fs_type = {
 	.name           = "erofs",
 	.init_fs_context = erofs_init_fs_context,
 	.kill_sb        = erofs_kill_sb,
-	.fs_flags       = FS_REQUIRES_DEV | FS_ALLOW_IDMAP,
+	.fs_flags       = FS_REQUIRES_DEV | FS_ALLOW_IDMAP | FS_LBS,
 };
 MODULE_ALIAS_FS("erofs");
 

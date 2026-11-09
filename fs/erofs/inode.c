@@ -33,6 +33,47 @@ static int erofs_fill_symlink(struct inode *inode, void *bptr, unsigned int ofs)
 	return 0;
 }
 
+static int erofs_inode_dax_supported(struct inode *inode)
+{
+	struct super_block *sb = inode->i_sb;
+	struct erofs_sb_info *sbi = EROFS_SB(sb);
+	struct erofs_buf buf = __EROFS_BUF_INITIALIZER;
+	struct erofs_map_blocks map = { .m_la = inode->i_size - 1 };
+	u64 end = erofs_pos(sb, sbi->dif0.blocks), pos, available;
+	unsigned int padding = -inode->i_size & (sb->s_blocksize - 1);
+	void *ptr;
+	int ret;
+
+	if (!inode->i_size)
+		return 1;
+	if (sbi->device_id_mask)
+		return sb->s_blocksize == PAGE_SIZE;
+	ret = erofs_map_blocks(inode, &map);
+	if (ret)
+		return ret;
+	if (!(map.m_flags & EROFS_MAP_MAPPED))
+		return 0;
+	if (check_add_overflow(map.m_pa, inode->i_size - map.m_la, &pos))
+		return -EFSCORRUPTED;
+	available = sb->s_bdev ? bdev_nr_bytes(sb->s_bdev) :
+			i_size_read(file_inode(sbi->dif0.file));
+	if (pos > end || padding > end - pos ||
+	    sbi->dif0.fsoff > available || end > available - sbi->dif0.fsoff)
+		return -EFSCORRUPTED;
+	if (padding) {
+		ptr = erofs_read_metabuf(&buf, sb, pos, false);
+		if (IS_ERR(ptr))
+			ret = PTR_ERR(ptr);
+		else if (memchr_inv(ptr, 0, padding))
+			ret = -EFSCORRUPTED;
+		erofs_put_metabuf(&buf);
+		if (ret)
+			return ret;
+	}
+	return sb->s_bdev && IS_ALIGNED((map.m_pa - map.m_la) | sbi->dif0.fsoff |
+				      sbi->dif0.dax_part_off, PAGE_SIZE);
+}
+
 static int erofs_read_inode(struct inode *inode)
 {
 	struct super_block *sb = inode->i_sb;
@@ -212,10 +253,18 @@ static int erofs_read_inode(struct inode *inode)
 			      inode_set_ctime_to_ts(inode, inode_get_mtime(inode)));
 
 	inode->i_flags &= ~S_DAX;
-	if (test_opt(&sbi->opt, DAX_ALWAYS) && S_ISREG(inode->i_mode) &&
+	if (S_ISREG(inode->i_mode) &&
 	    (vi->datalayout == EROFS_INODE_FLAT_PLAIN ||
-	     vi->datalayout == EROFS_INODE_CHUNK_BASED))
-		inode->i_flags |= S_DAX;
+	     vi->datalayout == EROFS_INODE_CHUNK_BASED)) {
+		err = erofs_inode_dax_supported(inode);
+		if (err < 0)
+			goto err_out;
+		if (err && test_opt(&sbi->opt, DAX_ALWAYS) &&
+		    (vi->datalayout == EROFS_INODE_FLAT_PLAIN ||
+		     sb->s_blocksize == PAGE_SIZE))
+			inode->i_flags |= S_DAX;
+		err = 0;
+	}
 err_out:
 	erofs_put_metabuf(&buf);
 	return err;
@@ -255,7 +304,7 @@ static int erofs_fill_inode(struct inode *inode)
 		return 0;
 	}
 
-	mapping_set_large_folios(inode->i_mapping);
+	mapping_set_folio_min_order(inode->i_mapping, get_order(i_blocksize(inode)));
 	aops = erofs_get_aops(inode);
 	if (IS_ERR(aops))
 		return PTR_ERR(aops);
