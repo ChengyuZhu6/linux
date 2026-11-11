@@ -145,10 +145,18 @@ static int erofs_init_device(struct erofs_buf *buf, struct super_block *sb,
 	}
 
 	if (!sbi->devs->flatdev) {
-		file = erofs_is_fileio_mode(sbi) ?
+		if (!dif->file)
+			file = erofs_is_fileio_mode(sbi) ?
 				filp_open(dif->path, O_RDONLY | O_LARGEFILE, 0) :
 				fs_bdev_file_open_by_path(dif->path,
 						BLK_OPEN_READ, sb->s_type, sb);
+		else if (erofs_is_fileio_mode(sbi))
+			file = get_file(dif->file);
+		else if (S_ISBLK(file_inode(dif->file)->i_mode))
+			file = fs_bdev_file_open_by_dev(file_inode(dif->file)->i_rdev,
+						BLK_OPEN_READ, sb->s_type, sb);
+		else
+			return -EINVAL;
 		if (IS_ERR(file)) {
 			if (file == ERR_PTR(-ENOTBLK))
 				return -EINVAL;
@@ -167,7 +175,10 @@ static int erofs_init_device(struct erofs_buf *buf, struct super_block *sb,
 				   dif->path);
 			clear_opt(&sbi->opt, DAX_ALWAYS);
 		}
+		if (dif->file)
+			fput(dif->file);
 		dif->file = file;
+		dif->bdev_claimed = !erofs_is_fileio_mode(sbi);
 	}
 
 	_48bit = erofs_sb_has_48bit(sbi);
@@ -445,7 +456,7 @@ static const struct fs_parameter_spec erofs_fs_parameters[] = {
 		     erofs_param_cache_strategy),
 	fsparam_flag("dax",			Opt_dax),
 	fsparam_enum("dax",			Opt_dax_enum, erofs_dax_param_enums),
-	fsparam_string("device",		Opt_device),
+	fsparam_file_or_string("device",	Opt_device),
 	fsparam_string("domain_id",		Opt_domain_id),
 	fsparam_flag_no("directio",		Opt_directio),
 	fsparam_u64("fsoffset",			Opt_fsoffset),
@@ -554,10 +565,19 @@ static int erofs_fc_parse_param(struct fs_context *fc,
 			return -EINVAL;
 		break;
 	case Opt_device:
+		if (param->type == fs_value_is_file) {
+			if (!(param->file->f_mode & FMODE_READ))
+				return -EBADF;
+			if (!S_ISREG(file_inode(param->file)->i_mode) &&
+			    !S_ISBLK(file_inode(param->file)->i_mode))
+				return invalf(fc, "unsupported device fd type");
+		}
 		dif = kzalloc_obj(*dif);
 		if (!dif)
 			return -ENOMEM;
-		dif->path = kstrdup(param->string, GFP_KERNEL);
+		dif->path = param->type == fs_value_is_file ?
+			kasprintf(GFP_KERNEL, "%pD", param->file) :
+			kstrdup(param->string, GFP_KERNEL);
 		if (!dif->path) {
 			kfree(dif);
 			return -ENOMEM;
@@ -571,6 +591,8 @@ static int erofs_fc_parse_param(struct fs_context *fc,
 			return ret;
 		}
 		++sbi->devs->extra_devices;
+		if (param->type == fs_value_is_file)
+			dif->file = no_free_ptr(param->file);
 		break;
 	case Opt_domain_id:
 		if (!IS_ENABLED(CONFIG_EROFS_FS_PAGE_CACHE_SHARE)) {
@@ -938,7 +960,7 @@ static int erofs_release_device_info(int id, void *ptr, void *data)
 
 	fs_put_dax(dif->dax_dev, NULL);
 	if (dif->file) {
-		if (S_ISBLK(file_inode(dif->file)->i_mode))
+		if (dif->bdev_claimed)
 			fs_bdev_file_release(dif->file, sb);
 		else
 			fput(dif->file);
@@ -974,8 +996,8 @@ static void erofs_fc_free(struct fs_context *fc)
 
 	/*
 	 * Freed here only if an error occurs before the sb is set up; at that
-	 * point no block-backed device has been claimed (that happens in
-	 * fill_super), so the NULL sb never reaches fs_bdev_file_release().
+	 * point any supplied device FDs are unclaimed.  Only devices opened
+	 * in fill_super use fs_bdev_file_release().
 	 */
 	if (sbi)
 		erofs_sb_free(sbi, NULL);

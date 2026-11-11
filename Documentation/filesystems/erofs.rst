@@ -130,7 +130,8 @@ cache_strategy=%s      Select a strategy for cached decompression from now on:
 dax={always,never}     Use direct access (no page cache).  See
                        Documentation/filesystems/dax.rst.
 dax                    A legacy option which is an alias for ``dax=always``.
-device=%s              Specify a path to an extra device to be used together.
+device=%s              Specify an extra device as a path or, through fsconfig,
+                       an already-opened file descriptor.
 directio               (For file-backed mounts) Use direct I/O to access backing
                        files, and asynchronous I/O will be enabled if supported.
 domain_id=%s           Specify a trusted domain ID. Filesystems sharing the same
@@ -165,6 +166,48 @@ instead.
 When superblock_share is specified, multiple mounts of the same backing
 file at the same fsoffset with compatible mount options can share a single
 superblock.  Remount is not allowed on shared superblocks.
+
+Extra device file descriptors
+============================
+
+The new mount API accepts ``FSCONFIG_SET_FD`` for ``device``, in addition to
+the existing path form.  File-backed mounts accept readable regular-file
+FDs for their external blobs.  Block-backed mounts accept readable block
+device FDs; the kernel claims the referenced block devices on behalf of the
+filesystem when creating the superblock.  The backing mode is still selected
+by ``source``.  Mixing regular-file blobs with a block-backed source, or block
+device blobs with a file-backed source, is rejected.
+
+For a file-backed image with two blobs, the calls are::
+
+    fs = fsopen("erofs", FSOPEN_CLOEXEC);
+    fsconfig(fs, FSCONFIG_SET_FD, "source", NULL, metadata_fd);
+    fsconfig(fs, FSCONFIG_SET_FD, "device", NULL, blob0_fd);
+    fsconfig(fs, FSCONFIG_SET_FD, "device", NULL, blob1_fd);
+    close(metadata_fd);
+    close(blob0_fd);
+    close(blob1_fd);
+    fsconfig(fs, FSCONFIG_CMD_CREATE, NULL, NULL, 0);
+    mnt = fsmount(fs, FSMOUNT_CLOEXEC, 0);
+    close(fs);
+    move_mount(mnt, "", AT_FDCWD, "/mnt/erofs", MOVE_MOUNT_F_EMPTY_PATH);
+    close(mnt);
+
+Check each call's return value in an application.  Successful SET_FD calls
+retain kernel references, so the caller may close the descriptors before
+CMD_CREATE.  Blob FDs can refer to unlinked files or memfds; their recorded
+names are for display and are not reopened as paths.  A block-backed primary
+source still uses its device path; the FD extension here is for extra devices.
+
+Repeat ``device`` in on-disk device-table order.  Paths and FDs may be mixed
+in that sequence.  ``device=3`` remains a pathname, not a descriptor number;
+use SET_FD to pass a descriptor.  Invalid, O_PATH and write-only descriptors
+are rejected, as are directories, pipes and character devices.
+
+This interface does not change image geometry or DAX eligibility.  Regular
+blob files continue to use file-backed I/O.  Keep image and blob contents
+immutable while mounted.  Tests and reproduction commands are in
+``tools/testing/selftests/filesystems/erofs/README.rst``.
 
 Sysfs Entries
 =============

@@ -45,6 +45,7 @@ struct erofs_device_info {
 	char *path;
 	struct file *file;
 	struct dax_device *dax_dev;
+	bool bdev_claimed;
 	u64 fsoff, dax_part_off;
 
 	erofs_blk_t blocks;
