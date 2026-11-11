@@ -995,9 +995,10 @@ static void erofs_fc_free(struct fs_context *fc)
 	struct erofs_sb_info *sbi = fc->s_fs_info;
 
 	/*
-	 * Freed here only if an error occurs before the sb is set up; at that
-	 * point any supplied device FDs are unclaimed.  Only devices opened
-	 * in fill_super use fs_bdev_file_release().
+	 * sget_fc() transfers sbi to a newly created superblock.  Otherwise
+	 * the context still owns it: before that transfer, when reusing an
+	 * existing superblock, or during reconfiguration.  Its device FDs
+	 * have not been registered against a superblock and need only fput().
 	 */
 	if (sbi)
 		erofs_sb_free(sbi, NULL);

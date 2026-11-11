@@ -181,6 +181,7 @@ device blobs with a file-backed source, is rejected.
 For a file-backed image with two blobs, the calls are::
 
     fs = fsopen("erofs", FSOPEN_CLOEXEC);
+    fsconfig(fs, FSCONFIG_SET_FLAG, "ro", NULL, 0);
     fsconfig(fs, FSCONFIG_SET_FD, "source", NULL, metadata_fd);
     fsconfig(fs, FSCONFIG_SET_FD, "device", NULL, blob0_fd);
     fsconfig(fs, FSCONFIG_SET_FD, "device", NULL, blob1_fd);

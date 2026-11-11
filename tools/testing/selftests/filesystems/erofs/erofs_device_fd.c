@@ -4,6 +4,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/loop.h>
 #include <linux/mount.h>
 #include <linux/reboot.h>
 #include <sched.h>
@@ -12,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/ioctl.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -26,7 +28,7 @@
 #define STATX_ATTR_DAX 0x00200000
 #endif
 
-static char meta[4096], blobs[2][4096];
+static char meta[4096], badmeta[4096], blobs[2][4096];
 static const char *devices[3];
 static unsigned int total, failures;
 
@@ -35,6 +37,25 @@ enum variant { NORMAL, UNLINKED, MEMFD, POSITION, ABORTED, DISCARDED, WRONG_TYPE
 static int config(int fs, unsigned int cmd, const char *key, const void *value, int aux)
 {
 	return syscall(SYS_fsconfig, fs, cmd, key, value, aux);
+}
+
+static int new_context(void)
+{
+	int fs = syscall(SYS_fsopen, "erofs", FSOPEN_CLOEXEC);
+
+	assert(fs >= 0);
+	assert(!config(fs, FSCONFIG_SET_FLAG, "ro", NULL, 0));
+	return fs;
+}
+
+static void attach_fs(int fs)
+{
+	int mnt = syscall(SYS_fsmount, fs, FSMOUNT_CLOEXEC, 0);
+
+	assert(mnt >= 0);
+	close(fs);
+	assert(!syscall(SYS_move_mount, mnt, "", AT_FDCWD, "mnt", MOVE_MOUNT_F_EMPTY_PATH));
+	close(mnt);
 }
 
 static void copy_file(int out, const char *path)
@@ -102,8 +123,8 @@ static void check_unclaimed(void)
 
 static void test_mount(bool block, unsigned int fdmask, enum variant variant, int count)
 {
-	int fs = syscall(SYS_fsopen, "erofs", FSOPEN_CLOEXEC);
-	int aliases[2] = { -1, -1 }, fd, mnt;
+	int fs = new_context();
+	int aliases[2] = { -1, -1 }, fd;
 
 	assert(fs >= 0);
 	assert(!config(fs, FSCONFIG_SET_STRING, "dax", block ? "always" : "never", 0));
@@ -172,11 +193,7 @@ static void test_mount(bool block, unsigned int fdmask, enum variant variant, in
 		close(fs);
 		goto out;
 	}
-	mnt = syscall(SYS_fsmount, fs, FSMOUNT_CLOEXEC, 0);
-	assert(mnt >= 0);
-	close(fs);
-	assert(!syscall(SYS_move_mount, mnt, "", AT_FDCWD, "mnt", MOVE_MOUNT_F_EMPTY_PATH));
-	close(mnt);
+	attach_fs(fs);
 	check_content(block);
 	assert(!umount("mnt"));
 	for (int i = 0; i < 2; ++i) {
@@ -256,6 +273,225 @@ static void run_case(bool block, unsigned int mask, enum variant variant, int co
 	       block, mask, variant, count);
 }
 
+enum lifetime_case { END_ABORT, END_MOUNT, END_DISCARD, BAD_COUNT, BAD_TYPE,
+	BAD_ROOT, DUP_FD, EXCLUSIVE_FD, LIVE_VMA, REUSE_SB, RECONFIG, READONLY_SOURCE };
+static char loop_paths[3][32];
+
+static int make_loop(const char *backing, int slot, bool exclusive)
+{
+	int ctl = open("/dev/loop-control", O_RDWR);
+	int number, fd, image;
+	struct loop_config cfg = {};
+
+	assert(ctl >= 0);
+	number = ioctl(ctl, LOOP_CTL_GET_FREE);
+	assert(number >= 0);
+	close(ctl);
+	snprintf(loop_paths[slot], sizeof(loop_paths[slot]), "/dev/loop%d", number);
+	fd = open(loop_paths[slot], O_RDONLY | (exclusive ? O_EXCL : 0));
+	image = open(backing, O_RDONLY);
+	assert(fd >= 0 && image >= 0);
+	cfg.fd = image;
+	cfg.info.lo_flags = LO_FLAGS_READ_ONLY | LO_FLAGS_AUTOCLEAR;
+	assert(!ioctl(fd, LOOP_CONFIGURE, &cfg));
+	close(image);
+	return fd;
+}
+
+/* AUTOCLEAR waits for the last opener, beyond releasing the holder claim. */
+static bool loop_bound(int slot)
+{
+	char path[128];
+
+	snprintf(path, sizeof(path), "/sys/block/%s/loop/backing_file", loop_paths[slot] + 5);
+	return !access(path, F_OK);
+}
+
+static void wait_loop_unbound(int slot)
+{
+	for (int i = 0; i < 100 && loop_bound(slot); ++i)
+		usleep(10000);
+	assert(!loop_bound(slot));
+}
+
+/* An OFD lock persists until the original struct file's final fput(). */
+static void ofd_lock(int fd, short type, bool conflict)
+{
+	struct flock lock = { .l_type = type, .l_whence = SEEK_SET };
+	int ret;
+
+	for (int i = 0; ; ++i) {
+		ret = fcntl(fd, F_OFD_SETLK, &lock);
+		if (!ret || conflict || (errno != EAGAIN && errno != EACCES) || i == 99)
+			break;
+		usleep(10000);
+	}
+
+	if (conflict)
+		assert(ret == -1 && (errno == EAGAIN || errno == EACCES));
+	else
+		assert(!ret);
+}
+
+static int fs_inputs(bool block, const char *metadata, int fd0, int fd1, int count)
+{
+	int fs = new_context(), source;
+
+	assert(fs >= 0);
+	assert(!config(fs, FSCONFIG_SET_STRING, "dax", "never", 0));
+	if (block) {
+		assert(!config(fs, FSCONFIG_SET_STRING, "source", metadata, 0));
+	} else {
+		source = open(metadata, O_RDONLY);
+		assert(source >= 0);
+		assert(!config(fs, FSCONFIG_SET_FD, "source", NULL, source));
+		close(source);
+	}
+	assert(!config(fs, FSCONFIG_SET_FD, "device", NULL, fd0));
+	if (count == 2)
+		assert(!config(fs, FSCONFIG_SET_FD, "device", NULL, fd1));
+	return fs;
+}
+
+static void test_lifetime(bool block, enum lifetime_case kind)
+{
+	int input[2], checker[2] = { -1, -1 }, fs, metadata_fd = -1;
+	int count = kind == BAD_COUNT ? 1 : 2;
+	int nowned = kind == BAD_COUNT || kind == BAD_TYPE || kind == DUP_FD ? 1 : 2;
+	const char *metadata = block ? devices[0] : meta;
+	unsigned char *map;
+	int datafd, ret, error;
+
+	for (int i = 0; i < 2; ++i) {
+		if (kind == BAD_TYPE && i == 1) {
+			input[i] = open(block ? blobs[i] : devices[i + 1], O_RDONLY);
+		} else if (block) {
+			input[i] = make_loop(blobs[i], i, kind == EXCLUSIVE_FD && i == 1);
+		} else {
+			input[i] = open(blobs[i], O_RDONLY);
+			checker[i] = open(blobs[i], O_RDWR);
+			assert(input[i] >= 0 && checker[i] >= 0);
+			ofd_lock(input[i], F_RDLCK, false);
+		}
+		assert(input[i] >= 0);
+	}
+	if (kind == BAD_ROOT || kind == READONLY_SOURCE) {
+		if (block) {
+			metadata_fd = make_loop(kind == BAD_ROOT ? badmeta : meta, 2, false);
+			metadata = loop_paths[2];
+		} else {
+			metadata = badmeta;
+		}
+	}
+	fs = fs_inputs(block, metadata, input[0], input[kind == DUP_FD ? 0 : 1], count);
+	close(input[0]);
+	close(input[1]);
+	if (!block)
+		for (int i = 0; i < nowned; ++i)
+			ofd_lock(checker[i], F_WRLCK, true);
+	else
+		for (int i = 0; i < nowned; ++i)
+			assert(loop_bound(i));
+	if (kind == END_ABORT) {
+		close(fs);
+		goto released;
+	}
+	ret = config(fs, FSCONFIG_CMD_CREATE, NULL, NULL, 0);
+	error = errno;
+	if (metadata_fd >= 0)
+		close(metadata_fd);
+	if (kind == BAD_COUNT || kind == BAD_TYPE || kind == BAD_ROOT || kind == EXCLUSIVE_FD) {
+		assert(ret == -1);
+		assert(error == (kind == BAD_ROOT ? EUCLEAN :
+				kind == EXCLUSIVE_FD ? EBUSY : EINVAL));
+		close(fs);
+		goto released;
+	}
+	assert(!ret);
+	if (kind == END_DISCARD || kind == DUP_FD || kind == READONLY_SOURCE) {
+		if (kind == READONLY_SOURCE)
+			assert(loop_bound(2));
+		close(fs);
+		goto released;
+	}
+	attach_fs(fs);
+	if (kind == REUSE_SB || kind == RECONFIG) {
+		int second[2];
+
+		for (int i = 0; i < 2; ++i) {
+			second[i] = open(block ? loop_paths[i] : blobs[i], O_RDONLY);
+			assert(second[i] >= 0);
+			if (!block)
+				ofd_lock(second[i], F_RDLCK, false);
+		}
+		if (kind == REUSE_SB) {
+			fs = fs_inputs(true, devices[0], second[0], second[1], 2);
+		} else {
+			fs = syscall(SYS_fspick, AT_FDCWD, "mnt", FSPICK_CLOEXEC);
+			assert(fs >= 0);
+			assert(!config(fs, FSCONFIG_SET_FD, "device", NULL, second[0]));
+			assert(!config(fs, FSCONFIG_SET_FD, "device", NULL, second[1]));
+		}
+		close(second[0]);
+		close(second[1]);
+		assert(!config(fs,
+			       kind == REUSE_SB ? FSCONFIG_CMD_CREATE : FSCONFIG_CMD_RECONFIGURE,
+			       NULL, NULL, 0));
+		close(fs);
+	}
+	if (kind == LIVE_VMA) {
+		datafd = open("mnt/data-0", O_RDONLY);
+		assert(datafd >= 0);
+		map = mmap(NULL, 65537, PROT_READ, MAP_SHARED, datafd, 0);
+		assert(map != MAP_FAILED);
+		close(datafd);
+		assert(umount("mnt") == -1 && errno == EBUSY);
+		assert(!umount2("mnt", MNT_DETACH));
+		if (block) {
+			assert(loop_bound(0) && loop_bound(1));
+		} else {
+			ofd_lock(checker[0], F_WRLCK, true);
+			ofd_lock(checker[1], F_WRLCK, true);
+		}
+		assert(map[0] == 0 && map[65536] == (65536U * 17) % 251);
+		assert(!munmap(map, 65537));
+	} else {
+		assert(!umount("mnt"));
+	}
+released:
+	if (block) {
+		for (int i = 0; i < 3; ++i) {
+			if (loop_paths[i][0])
+				wait_loop_unbound(i);
+		}
+	} else {
+		for (int i = 0; i < nowned; ++i)
+			ofd_lock(checker[i], F_WRLCK, false);
+		for (int i = 0; i < 2; ++i)
+			if (checker[i] >= 0)
+				close(checker[i]);
+	}
+}
+
+static void run_lifetime(bool block, enum lifetime_case kind)
+{
+	pid_t child = fork();
+	int status;
+
+	assert(child >= 0);
+	++total;
+	if (!child) {
+		test_lifetime(block, kind);
+		_exit(0);
+	}
+	assert(waitpid(child, &status, 0) == child);
+	umount2("mnt", MNT_DETACH);
+	if (!WIFEXITED(status) || WEXITSTATUS(status))
+		++failures;
+	printf("%s lifetime block=%d kind=%d\n",
+	       WIFEXITED(status) && !WEXITSTATUS(status) ? "PASS" : "FAIL", block, kind);
+}
+
 static int suite(const char *fixtures)
 {
 	char scratch[] = "/tmp/erofs-device-fd-XXXXXX";
@@ -263,6 +499,8 @@ static int suite(const char *fixtures)
 
 	assert(base);
 	assert(snprintf(meta, sizeof(meta), "%s/meta.erofs", base) < (int)sizeof(meta));
+	assert(snprintf(badmeta, sizeof(badmeta), "%s/bad-meta.erofs", base) <
+	       (int)sizeof(badmeta));
 	for (int i = 0; i < 2; ++i)
 		assert(snprintf(blobs[i], sizeof(blobs[i]), "%s/blob-%d", base, i) <
 		       (int)sizeof(blobs[i]));
@@ -288,6 +526,16 @@ static int suite(const char *fixtures)
 			run_case(block, 3, NORMAL, 2);
 	}
 	run_case(false, 0, INVALID, 0);
+	for (int block = 0; block <= !!devices[0]; ++block) {
+		for (enum lifetime_case kind = END_ABORT; kind <= READONLY_SOURCE; ++kind) {
+			if (!block && (kind == EXCLUSIVE_FD || kind == REUSE_SB ||
+				       kind == READONLY_SOURCE))
+				continue;
+			if (!devices[0] && kind == BAD_TYPE)
+				continue;
+			run_lifetime(block, kind);
+		}
+	}
 	assert(!rmdir("mnt"));
 	assert(!chdir("/"));
 	assert(!rmdir(scratch));
