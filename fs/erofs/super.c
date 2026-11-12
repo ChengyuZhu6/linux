@@ -151,7 +151,7 @@ static int erofs_init_device(struct erofs_buf *buf, struct super_block *sb,
 				fs_bdev_file_open_by_path(dif->path,
 						BLK_OPEN_READ, sb->s_type, sb);
 		else if (erofs_is_fileio_mode(sbi))
-			file = get_file(dif->file);
+			file = no_free_ptr(dif->file);
 		else if (S_ISBLK(file_inode(dif->file)->i_mode))
 			file = fs_bdev_file_open_by_dev(file_inode(dif->file)->i_rdev,
 						BLK_OPEN_READ, sb->s_type, sb);
